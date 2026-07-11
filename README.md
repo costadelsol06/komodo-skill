@@ -22,13 +22,23 @@ site alone, which lags behind and omits some details.
 
 ## Install
 
-Copy `komodo/` into your Claude Code skills directory:
+This repo follows the [Agent Skills specification](https://agentskills.io/specification)
+and works with the [`skills` CLI](https://github.com/vercel-labs/skills), compatible with
+30+ agents/IDEs (Claude Code, Codex CLI, Cursor, VS Code, Gemini CLI, GitHub Copilot,
+Goose, Roo Code, and more):
 
 ```bash
-cp -r komodo ~/.claude/skills/
+npx skills add costadelsol06/komodo-skill
 ```
 
-Or, for a project-local skill, into `.claude/skills/` at your repo root.
+The CLI auto-detects which agents you have installed and places the skill in the right
+directory for each (e.g. `~/.claude/skills/` or `.claude/skills/` for Claude Code).
+
+**Manual install** (Claude Code): copy `skills/komodo/` into `~/.claude/skills/`:
+
+```bash
+cp -r skills/komodo ~/.claude/skills/
+```
 
 ## License
 
