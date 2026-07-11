@@ -168,8 +168,10 @@ Komodo's own update-check flow, `check_stack_for_update_inner`) recomputes this 
 Same param shape as every other Stack action — one field, the Stack id or name:
 
 ```bash
+# Reads credentials from env vars — never hardcode or print a key/secret (see API section)
 curl -X POST https://<your-komodo-host>/write \
-  -H "X-Api-Key: K_..." -H "X-Api-Secret: S_..." -H "Content-Type: application/json" \
+  -H "X-Api-Key: $KOMODO_API_KEY" -H "X-Api-Secret: $KOMODO_API_SECRET" \
+  -H "Content-Type: application/json" \
   -d '{"type":"RefreshStackCache","params":{"stack":"<stack-id-or-name>"}}'
 ```
 
@@ -287,16 +289,20 @@ To script the HTTP API (e.g. to create resources without hand-filling UI forms, 
 easy to mistype on multi-field forms like Procedure stages):
 
 ```bash
-# One-time: mint a key for an existing user, straight from the DB (no browser/session needed)
-docker exec <core-container> km create api-key "my-automation" --for <username>
-# -> {"key": "K_...", "secret": "S_..."}
+# One-time: mint a key for an existing user, straight from the DB (no browser/session needed).
+# Store both fields directly into a chmod-600 file or env vars — never echo/print/log a
+# key or secret value; treat them as write-only from the moment they're generated.
+docker exec <core-container> km create api-key "my-automation" --for <username> \
+  > /path/to/credentials-file   # chmod 600 this file immediately, before reading it
 ```
 
 ```bash
-# Wire protocol confirmed empirically: POST to /read, /write, /execute with these headers
+# Wire protocol confirmed empirically: POST to /read, /write, /execute with these headers.
+# Source credentials from env vars (or the file above) — never inline a literal key/secret
+# in a command, and never have the agent print/output a key or secret value verbatim.
 curl -X POST https://<your-komodo-host>/write \
-  -H "X-Api-Key: K_..." \
-  -H "X-Api-Secret: S_..." \
+  -H "X-Api-Key: $KOMODO_API_KEY" \
+  -H "X-Api-Secret: $KOMODO_API_SECRET" \
   -H "Content-Type: application/json" \
   -d '{"type":"CreateProcedure","params":{"name":"...", "config": {...}}}'
 ```
