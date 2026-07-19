@@ -1,6 +1,6 @@
 ---
 name: komodo
-description: Use when deploying, configuring, or troubleshooting Komodo (komo.do) — a Docker/Compose orchestration platform with Core/Periphery architecture. Covers Stack and Build resources, auto-update, custom image rebuilds via Procedures, the Komodo API/CLI, and specific failure modes like "pull access denied", "Resource is busy", stale cache after Delete, and Periphery network/build issues.
+description: Use when deploying, configuring, or troubleshooting Komodo (komo.do) — a Docker/Compose orchestration platform with Core/Periphery architecture. Covers Stack and Build resources, auto-update, custom image rebuilds via Procedures, the Komodo API/CLI, and specific failure modes like "pull access denied", "Resource is busy", stale cache after Delete, Periphery network/build or "network is unreachable" IPv6 issues, and a scheduled RunBuild/Procedure that intermittently fails with a DNS or registry-auth-looking error (e.g. "server misbehaving", "failed to fetch anonymous token") at the same time every day.
 ---
 
 # Komodo
@@ -30,6 +30,11 @@ directly or by reproducing the failure on a live instance.
 - Automating "rebuild a locally-built image, then redeploy just that service"
 - Calling the Komodo HTTP API or `km` CLI programmatically
 - Periphery's Docker builds fail with DNS/network errors despite the host having internet
+- The "Global Auto Update" Procedure fails nightly with `network is unreachable` on an
+  IPv6 address, even though the host itself has working IPv6
+- A scheduled `RunBuild`/Procedure fails intermittently or every day at the same clock
+  time with a DNS/registry error that looks like a Docker Hub auth problem, but network
+  connectivity tests fine outside that window
 
 ## Quick Reference
 
@@ -41,7 +46,9 @@ directly or by reproducing the failure on a live instance.
 | Need to build a Docker image Komodo doesn't need to push anywhere | Registry is optional | Leave `image_registry` empty on the Build — image is built and tagged locally only |
 | Need a periodic "rebuild custom image + redeploy" | `RunBuild` never triggers a Stack redeploy by itself | Procedure: Stage 1 `RunBuild` (parallel OK), Stage 2+ `DeployStack{services:[...]}` (one Stack per parallel group) |
 | Periphery `docker build` fails resolving DNS for the base image | Periphery's own container network has no internet egress | Give Periphery's container a network with real internet egress — **not** the same bridge as public-facing containers (see Networking) |
+| "Global Auto Update" fails nightly, `dial tcp [<ipv6>]:443: connect: network is unreachable` | Periphery's egress network has `EnableIPv6=false`; Docker's embedded DNS still returns AAAA records for the registry host, and there's no IPv6 route to try them on | Enable IPv6 (`enable_ipv6: true` + a ULA subnet) on that network — isolation is unaffected, see IPv6 Egress section |
 | Need to script Komodo config instead of clicking through the UI | — | Generate an API key via `km create api-key`, call the HTTP API directly (see API section) |
+| Scheduled `RunBuild` fails daily at the same instant with a DNS/token error (`server misbehaving`, `failed to fetch anonymous token`) that reads like Docker Hub auth, but works fine when run manually | A Procedure's `"Every day at HH:MM"` schedule runs in **Core container's own `TZ`** (e.g. `Europe/Paris`), not UTC — it collides on the real clock with another daily job (backup, cron) that saturates CPU/I-O at that instant | Check Core's `TZ` (`docker exec <core> date`), convert the schedule to the same clock as the colliding job, and stagger one of them — see Schedule Collisions section |
 
 ## Architecture
 
@@ -259,6 +266,61 @@ Notes:
 - Exclude locally-built services from a Stack's `auto_update_skip_services` list — they
   have no registry to poll, so leaving them out avoids meaningless check attempts (though
   it isn't unsafe if you don't).
+- The schedule string is evaluated in **Core's container `TZ`**, not UTC — see Schedule
+  Collisions below before assuming two differently-worded daily schedules don't overlap.
+
+## Schedule Collisions Across Containers (the timezone trap)
+
+A Procedure's `schedule = "Every day at HH:MM"` (or a Cron schedule) is evaluated in
+**the Core container's own `TZ`**, not necessarily UTC and not necessarily the host's
+timezone. If Core was started with `TZ=Europe/Paris` (or any non-UTC zone) while some
+other daily job on the same host — a backup container's `BACKUP_CRON_EXPRESSION`, a
+systemd timer, another Procedure — is defined in **UTC**, "different-looking" schedules
+can silently land on the exact same real-world instant every day.
+
+**Symptom:** a scheduled `RunBuild` (or any Procedure) fails intermittently or every
+single day at the same clock time, with an error that looks like a network/registry
+problem — `dial tcp: lookup auth.docker.io on 127.0.0.11:53: server misbehaving`,
+`failed to fetch anonymous token`, timeouts — but:
+- the same build succeeds when triggered manually outside that time window,
+- a throwaway container on the same network resolves and connects to the registry fine
+  right now (see the `alpine`/`curl` test in the IPv6 section above),
+- nothing about the network config itself changed.
+
+This is the signature of **resource contention**, not a broken network: two unrelated
+daily jobs are firing at the same wall-clock instant, and whichever one needs a fresh
+DNS lookup or TCP handshake at that exact moment loses the race under CPU/I-O pressure
+from the other (e.g. a `tar`+`gzip` volume backup pegging a small VPS's vCPUs for a
+minute or two). The DNS/auth-shaped error is a side effect, not the root cause — do not
+"fix" it by touching network config (IPv6, egress rules, etc.) if this is the actual
+cause; that just treats the symptom in one incident and leaves the collision to
+resurface differently later.
+
+**Diagnosis:**
+1. Pull every failing execution's timestamp via `ListUpdates`/`GetUpdate` (see API
+   section) and confirm it's the *same* time each day.
+2. Check Core's actual timezone: `docker exec <core-container> date` — compare against
+   what the schedule string implies in UTC.
+3. Check every other daily job on the host for the same real UTC instant: container cron
+   env vars (`docker inspect <container> --format '{{range .Config.Env}}{{println .}}
+   {{end}}'` grep `CRON`), `systemctl list-timers`, other Procedure schedules
+   (`ListProcedures` + `GetProcedure`).
+4. Confirm connectivity is fine *outside* the collision window (the `docker run --rm
+   --network <egress-network> alpine curl ...` test from the IPv6 section) — this rules
+   out a persistent network/config regression and points at timing instead.
+
+**Fix:** stagger one of the two schedules so they no longer land on the same instant —
+changing the Komodo side is usually simplest, via `UpdateProcedure`:
+
+```bash
+curl -X POST https://<your-komodo-host>/write \
+  -H "X-Api-Key: $KOMODO_API_KEY" -H "X-Api-Secret: $KOMODO_API_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{"type":"UpdateProcedure","params":{"id":"<procedure-id>","config":{"schedule":"Every day at 05:00"}}}'
+```
+
+A gap of even 15-20 minutes is enough for a short (~1-2 min) colliding job; pick a wider
+gap if the other job's duration is unknown or variable.
 
 ## Networking Requirements for Periphery
 
@@ -278,6 +340,62 @@ containers increases the blast radius if one of those is ever compromised, even 
 Periphery authenticates inbound connections by keypair. A separate outbound-only bridge
 network gives Periphery internet access with zero network-level reachability from (or to)
 the public-facing containers.
+
+## IPv6 on Periphery's Egress Network — Enabling It Without Breaking Isolation
+
+If Periphery's dedicated egress network (previous section) has IPv6 disabled
+(`EnableIPv6: false`, the Docker default for a new bridge network), a subtle failure
+shows up: Docker's embedded DNS resolver proxies the host's own upstream resolvers, so
+lookups for `auth.docker.io` / `registry-1.docker.io` can return AAAA records even though
+the network has no IPv6 route. Periphery then dials that IPv6 address and fails with
+`network is unreachable` — a routing failure, not a DNS one. It surfaces specifically in
+the built-in "Global Auto Update" Procedure's nightly check (`CheckStackForUpdateInner`
+in Core's logs), one failure line per affected service, every service check otherwise
+unrelated to it.
+
+**It's safe to enable IPv6 on this network without weakening isolation.** As of Docker
+Engine 27.0.1+, `ip6tables`-based NAT66 is enabled **by default** on user-defined bridge
+networks (`com.docker.network.bridge.gateway_mode_ipv6=nat`), giving a private ULA
+(`fd00::/8`) subnet outbound-only internet access — the same non-routable-from-outside
+guarantee IPv4 NAT already provides. Bridge networks stay mutually isolated regardless of
+whether either side has IPv6 enabled; the only real requirement is picking a
+**non-overlapping** ULA subnet from any other IPv6-enabled network on the host (e.g. a
+public-facing one):
+
+```yaml
+networks:
+  egress:
+    driver: bridge
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: fd00:c0de:cafe:2::/64   # distinct from any other IPv6-enabled network's ULA
+```
+
+Avoid the alternative `gateway_mode_ipv6=routed` mode — that assigns containers
+globally-routable addresses directly (no NAT), which genuinely would expose them if the
+host routes to that prefix. Leave it unset; NAT is the default and what an egress-only
+network wants.
+
+**Applying the change:** `enable_ipv6` can't be flipped on a live network — Docker
+requires recreating it: `docker compose stop periphery` → `docker network rm <network>` →
+`docker compose up -d`. Watch for one more trap: if the container was only *stopped* (not
+removed), it can retain a reference to the old network ID and fail to start once the
+network is recreated (`network <old-id> not found`) — run `docker compose rm -f
+periphery` before the final `up -d` to clear it.
+
+**Verifying it worked:** `docker exec` into Periphery can itself fail with an AppArmor
+error if it bind-mounts `/proc:ro` (common, e.g. for monitoring) — that's unrelated to
+networking, don't mistake it for a connectivity problem. Test with a throwaway container
+on the same network instead:
+
+```bash
+docker run --rm --network <egress-network> alpine sh -c \
+  "apk add --no-cache curl >/dev/null; curl -6 -m 8 -sS -o /dev/null -w '%{http_code}\n' https://auth.docker.io/"
+```
+
+Any real HTTP response (even a 404 from the token endpoint) confirms the TCP/TLS path
+works; `network is unreachable` means it's still broken.
 
 ## Using the API / CLI Instead of the UI
 
@@ -339,3 +457,8 @@ failing execution's own detailed log.
 - **Reading only the top-level Procedure result.** Errors from one failed execution in a
   parallel stage can overshadow siblings that also failed; always drill into individual
   execution logs when a stage reports a failure.
+- **Chasing a network/DNS fix for a scheduled build failure without checking for a
+  colliding job first.** A DNS or registry-auth-looking error that only happens at one
+  fixed time of day is a resource-contention symptom, not evidence the network config
+  regressed — compare every daily job's *real* UTC time (accounting for each container's
+  own `TZ`) before touching IPv6/egress settings again. See Schedule Collisions above.

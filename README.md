@@ -17,7 +17,10 @@ site alone, which lags behind and omits some details.
 - Why `Delete` on a Stack is **not** a safe metadata-only operation, and the
   non-destructive alternative (`RefreshStackCache`)
 - Building images locally with no registry, and automating rebuild+redeploy on a schedule
-- Periphery's networking requirements for `RunBuild` (DNS/egress gotchas)
+- Periphery's networking requirements for `RunBuild` (DNS/egress gotchas), including
+  enabling IPv6 on an isolated egress network without breaking isolation
+- Why a scheduled Procedure can fail daily with a DNS/registry-auth-looking error that's
+  actually a timezone-driven schedule collision with another job (e.g. a nightly backup)
 - Scripting the Komodo API/CLI instead of clicking through the UI
 
 ## Install
@@ -28,7 +31,7 @@ and works with the [`skills` CLI](https://github.com/vercel-labs/skills), compat
 Goose, Roo Code, and more):
 
 ```bash
-npx skills add costadelsol06/komodo-skill
+npx skills add costadelsol06/komodo-skill-v2
 ```
 
 The CLI auto-detects which agents you have installed and places the skill in the right
